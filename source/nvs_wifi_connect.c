@@ -8,6 +8,9 @@
 #include "nvs_wifi_connect_private.h"
 #include "nvs_wifi_connect.h"
 
+#include <stdio.h>
+#include <string.h>
+
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
 
@@ -20,6 +23,7 @@ static EventGroupHandle_t s_wifi_event_group;
 static const char *TAG = "nvs_wifi_connect";
 
 static int short_retry_num = 0;
+static const TickType_t STA_CONNECT_TIMEOUT_TICKS = pdMS_TO_TICKS(30000);
 
 static void event_handler_sta(void *arg, esp_event_base_t event_base,
                               int32_t event_id, void *event_data)
@@ -39,7 +43,10 @@ static void event_handler_sta(void *arg, esp_event_base_t event_base,
         else
         {
             // check long retry
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            if (s_wifi_event_group)
+            {
+                xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            }
         }
         ESP_LOGI(TAG, "connect to the AP fail");
     }
@@ -48,7 +55,10 @@ static void event_handler_sta(void *arg, esp_event_base_t event_base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
         short_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        if (s_wifi_event_group)
+        {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        }
     }
 }
 
@@ -90,8 +100,8 @@ static void init_softap(char *ap_ssid, char *ap_pass)
             .max_connection = AP_MAX_STA_CONN,
             .authmode = WIFI_AUTH_WPA_WPA2_PSK},
     };
-    strcpy((char *)wifi_config.ap.ssid, ap_ssid);
-    strcpy((char *)wifi_config.ap.password, ap_pass);
+    snprintf((char *)wifi_config.ap.ssid, sizeof(wifi_config.ap.ssid), "%s", ap_ssid ? ap_ssid : "");
+    snprintf((char *)wifi_config.ap.password, sizeof(wifi_config.ap.password), "%s", ap_pass ? ap_pass : "");
 
     if (strlen((char *)wifi_config.ap.password) < 8)
     {
@@ -103,19 +113,23 @@ static void init_softap(char *ap_ssid, char *ap_pass)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s",
-             ap_ssid, ap_pass);
+    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s",
+             (char *)wifi_config.ap.ssid);
 }
 
 static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
 {
     esp_err_t err = ESP_OK;
     s_wifi_event_group = xEventGroupCreate();
+    if (!s_wifi_event_group)
+    {
+        return ESP_ERR_NO_MEM;
+    }
 
     // ESP_ERROR_CHECK(esp_netif_init());
     // ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -141,8 +155,8 @@ static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
                 .required = false},
         },
     };
-    strcpy((char *)wifi_config.sta.ssid, sta_ssid);
-    strcpy((char *)wifi_config.sta.password, sta_pass);
+    snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%s", sta_ssid ? sta_ssid : "");
+    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s", sta_pass ? sta_pass : "");
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -156,40 +170,56 @@ static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                            pdFALSE,
                                            pdFALSE,
-                                           portMAX_DELAY);
+                                           STA_CONNECT_TIMEOUT_TICKS);
 
     /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
      * happened. */
     if (bits & WIFI_CONNECTED_BIT)
     {
-        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
-                 sta_ssid, sta_pass);
+        ESP_LOGI(TAG, "connected to ap SSID:%s",
+                 (char *)wifi_config.sta.ssid);
         err = ESP_OK;
     }
     else if (bits & WIFI_FAIL_BIT)
     {
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
-                 sta_ssid, sta_pass);
+        ESP_LOGI(TAG, "Failed to connect to SSID:%s",
+                 (char *)wifi_config.sta.ssid);
         err = ESP_FAIL;
     }
     else
     {
-        ESP_LOGE(TAG, "UNEXPECTED EVENT");
-        err = ESP_FAIL;
+        ESP_LOGE(TAG, "Timed out connecting to SSID:%s",
+                 (char *)wifi_config.sta.ssid);
+        err = ESP_ERR_TIMEOUT;
     }
 
     /* The event will not be processed after unregister */
     ESP_ERROR_CHECK(esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip));
     ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, instance_any_id));
     vEventGroupDelete(s_wifi_event_group);
+    s_wifi_event_group = NULL;
+    if (err != ESP_OK)
+    {
+        esp_wifi_stop();
+        esp_wifi_deinit();
+        if (sta_netif)
+        {
+            esp_netif_destroy_default_wifi(sta_netif);
+        }
+    }
     return err;
 }
 
-static esp_err_t nvs_get_key_value_str(char *key, char *value)
+static esp_err_t nvs_get_key_value_str(const char *key, char *value, size_t value_size)
 {
     nvs_handle_t nvs_handle;
-    size_t length = 64;
+    size_t length = value_size;
     esp_err_t ret = ESP_OK;
+    if (!key || !value || value_size == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    value[0] = 0;
     ret = nvs_open(NVS_STORAGE_NAME, NVS_READWRITE, &nvs_handle);
     if (ret)
     {
@@ -224,27 +254,36 @@ esp_err_t nvs_wifi_connect(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     err = ESP_OK;
-    if (nvs_get_key_value_str(NVS_STA_AP_DEFAULT_MODE_KEY, nvs_mode) == ESP_OK)
+    if (nvs_get_key_value_str(NVS_STA_AP_DEFAULT_MODE_KEY, nvs_mode, sizeof(nvs_mode)) == ESP_OK)
     {
         if (strncmp(NVS_WIFI_CONNECT_MODE_STA, nvs_mode, sizeof(NVS_WIFI_CONNECT_MODE_STA)) == 0) // sta
         {
-            if ((nvs_get_key_value_str(NVS_STA_ESP_WIFI_SSID_KEY, nvs_ssid) || nvs_get_key_value_str(NVS_STA_ESP_WIFI_PASS_KEY, nvs_password)) == ESP_OK)
+            esp_err_t ssid_err = nvs_get_key_value_str(NVS_STA_ESP_WIFI_SSID_KEY, nvs_ssid, sizeof(nvs_ssid));
+            if (nvs_get_key_value_str(NVS_STA_ESP_WIFI_PASS_KEY, nvs_password, sizeof(nvs_password)) != ESP_OK)
+            {
+                nvs_password[0] = 0;
+            }
+            if (ssid_err == ESP_OK)
             {
                 if (init_sta(nvs_ssid, nvs_password) == ESP_OK) // ssid & pass OK
                 {
                     return ESP_OK;
                 }
             }
-            ESP_LOGE(TAG, "STA ERR ssid=%s pass=%s", nvs_ssid, nvs_password);
+            ESP_LOGE(TAG, "STA ERR ssid=%s", nvs_ssid);
             err = ESP_ERR_INVALID_ARG;
         }
-        if (nvs_get_key_value_str(NVS_AP_ESP_WIFI_SSID_KEY, nvs_ssid) || nvs_get_key_value_str(NVS_AP_ESP_WIFI_PASS_KEY, nvs_password) == ESP_OK)
+        if (nvs_get_key_value_str(NVS_AP_ESP_WIFI_SSID_KEY, nvs_ssid, sizeof(nvs_ssid)) == ESP_OK)
         {
+            if (nvs_get_key_value_str(NVS_AP_ESP_WIFI_PASS_KEY, nvs_password, sizeof(nvs_password)) != ESP_OK)
+            {
+                nvs_password[0] = 0;
+            }
             init_softap(nvs_ssid, nvs_password); // ssid & pass OK
             return err;
         }
     }
-    ESP_LOGE(TAG, "AP ERR ssid=%s pass=%s Start default AP", nvs_ssid, nvs_password);
+    ESP_LOGE(TAG, "AP ERR ssid=%s. Start default AP", nvs_ssid);
     init_softap(CONFIG_DEFAULT_AP_ESP_WIFI_SSID, CONFIG_DEFAULT_AP_ESP_WIFI_PASS);
 
     return ESP_ERR_INVALID_ARG;

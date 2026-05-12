@@ -12,6 +12,13 @@ menu "Nvs WiFi Connect"
         help
             WEB ws URI to set ssid/pass.
 
+    config DEFAULT_NVS_WIFI_CONNECT_HTTP_PORT
+        int "Connect HTTP server port"
+        range 1 65535
+        default 80
+        help
+            HTTP server port for the WiFi configuration page.
+
     config DEFAULT_AP_ESP_WIFI_SSID
         string "Default AP SSID"
         default "Provision_Wifi_AP"
