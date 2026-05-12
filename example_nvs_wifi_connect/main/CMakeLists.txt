@@ -5,7 +5,9 @@ idf_component_register(
     INCLUDE_DIRS "." 
     REQUIRES  
         nvs_wifi_connect
+        esp_event
         esp_http_server 
+        esp_netif
         esp_wifi
         mdns
     EMBED_FILES 

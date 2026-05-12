@@ -6,6 +6,9 @@
    CONDITIONS OF ANY KIND, either express or implied.
 */
 
+#include <stdlib.h>
+#include <string.h>
+
 #include <esp_wifi.h>
 #include <esp_event.h>
 #include <esp_log.h>
