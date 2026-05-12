@@ -10,6 +10,8 @@ idf_component_register(
        esp_http_server
        #mdns
     PRIV_REQUIRES 
+        esp_event
+        esp_netif
         nvs_flash 
         esp_wifi
     EMBED_FILES 
