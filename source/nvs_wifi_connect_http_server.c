@@ -23,6 +23,7 @@ enum
 
 static int srv_restart = 0;
 static nvs_wifi_connect_register_uri_handler_t srv_register_uri_handler;
+static nvs_wifi_connect_auth_handler_t srv_auth_handler;
 static bool srv_event_handlers_registered;
 
 static esp_err_t stop_webserver(httpd_handle_t server);
@@ -30,6 +31,19 @@ static void send_json_string(char *str, httpd_req_t *req);
 static void disconnect_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 static void connect_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 static void full_stop_httpd_server(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
+
+void nvs_wifi_connect_set_auth_handler(nvs_wifi_connect_auth_handler_t auth_handler)
+{
+    srv_auth_handler = auth_handler;
+}
+
+static esp_err_t check_auth(httpd_req_t *req)
+{
+    if (!srv_auth_handler) {
+        return ESP_OK;
+    }
+    return srv_auth_handler(req);
+}
 
 static void unregister_server_event_handlers(void)
 {
@@ -231,6 +245,10 @@ static esp_err_t ws_handler(httpd_req_t *req)
 {
     if (req->method == HTTP_GET)
     {
+        esp_err_t auth = check_auth(req);
+        if (auth != ESP_OK) {
+            return auth;
+        }
         ESP_LOGI(TAG, "Handshake done, the new connection was opened");
         send_nvs_data(req); // read & send initial wifi data from nvs
         return ESP_OK;
@@ -297,6 +315,7 @@ static httpd_handle_t start_webserver(void)
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = CONFIG_DEFAULT_NVS_WIFI_CONNECT_HTTP_PORT;
+    config.max_uri_handlers = 24;
     // Start the httpd server
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
     if (httpd_start(&server, &config) == ESP_OK)

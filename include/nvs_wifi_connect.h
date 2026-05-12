@@ -56,6 +56,14 @@ esp_err_t nvs_wifi_connect_register_uri_handler(httpd_handle_t server);
 *   @brief handle for connecting to the nvs_wifi_connect_http_server server
 */
 typedef esp_err_t (*nvs_wifi_connect_register_uri_handler_t)(httpd_handle_t server);
+typedef esp_err_t (*nvs_wifi_connect_auth_handler_t)(httpd_req_t *req);
+
+/*
+*   @brief optional request authorizer for the built-in Wi-Fi WebSocket.
+*          The handler should return ESP_OK to allow access, or send an HTTP
+*          error response and return a non-OK esp_err_t to deny access.
+*/
+void nvs_wifi_connect_set_auth_handler(nvs_wifi_connect_auth_handler_t auth_handler);
 
 /*
 *   @brief  start nvs_wifi_connect httpd server, uri web page read existing nvs wifi data  & write new nvs wifi data ( ap/sta mode, wifi ssid/pass )

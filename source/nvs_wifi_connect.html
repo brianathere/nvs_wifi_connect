@@ -118,6 +118,10 @@
             padding: 16px;
         }
 
+        .access-panel {
+            margin-top: 16px;
+        }
+
         .span-4 {
             grid-column: span 4;
         }
@@ -384,7 +388,22 @@
             </div>
         </header>
 
-        <div class="grid">
+        <section class="access-panel hidden" id="accessPanel">
+            <h2>Web UI Access</h2>
+            <form>
+                <label>
+                    Password
+                    <input type="password" id="accessPassword" autocomplete="current-password" placeholder="4-64 characters">
+                </label>
+                <div class="form-actions">
+                    <button class="primary" id="accessUnlock" type="button">Unlock</button>
+                    <button class="primary" id="accessSetup" type="button">Set Password</button>
+                </div>
+                <div class="status-line" id="accessStatus"></div>
+            </form>
+        </section>
+
+        <div class="grid" id="dashboard">
             <div class="metric span-4">
                 <div class="label">Door</div>
                 <div class="value" id="doorState">Unknown</div>
@@ -448,17 +467,21 @@
             </section>
 
             <section class="span-6">
-                <h2>Admin Access</h2>
+                <h2>Web UI Password</h2>
                 <form>
                     <div class="split-actions">
                         <label>
-                            Admin PIN
-                            <input type="password" id="adminPin" autocomplete="off" placeholder="4-32 characters">
+                            Current password
+                            <input type="password" id="adminPin" autocomplete="current-password" placeholder="4-64 characters">
                         </label>
                         <button class="primary" id="adminUnlock" type="button">Unlock</button>
                     </div>
+                    <label>
+                        New password
+                        <input type="password" id="adminNewPin" autocomplete="new-password" placeholder="4-64 characters">
+                    </label>
                     <div class="form-actions">
-                        <button id="adminSetup" type="button">Create PIN</button>
+                        <button id="adminSetup" type="button">Set Password</button>
                     </div>
                     <div class="status-line" id="adminStatus"></div>
                 </form>
@@ -605,14 +628,15 @@
     <script>
         const els = {};
         const ids = [
-            "socketPill", "socketText", "buildSummary", "doorState", "doorDetail", "wifiState",
+            "accessPanel", "dashboard", "accessPassword", "accessUnlock", "accessSetup",
+            "accessStatus", "socketPill", "socketText", "buildSummary", "doorState", "doorDetail", "wifiState",
             "wifiDetail", "healthState", "healthDetail", "gdoProtocol", "gdoSync", "gdoLight",
             "gdoLock", "gdoMotion", "gdoObstruction", "gdoMotor", "gdoButton", "gdoBattery",
             "gdoLearn", "gdoOpenings", "gdoPaired", "gdoLastRx", "gdoTiming", "appUptime",
             "appReset", "appHomekit", "heapFree", "heapLow", "appBuild", "wifiMode",
             "wifiSsid", "wifiRssi", "wifiStaIp", "wifiApIp", "wifiHttpPort", "wifiStaMac",
             "wifiApMac", "wifiSaveStatus", "nvsApStaMode", "modeSta", "modeAp", "nvsStaSsid",
-            "nvsStaPass", "nvsApSsid", "nvsApPass", "adminPin", "adminUnlock", "adminSetup",
+            "nvsStaPass", "nvsApSsid", "nvsApPass", "adminPin", "adminNewPin", "adminUnlock", "adminSetup",
             "adminStatus", "positionTarget", "positionApply", "positionTargetLabel",
             "positionAvailable", "controlStatus", "settingProtocol", "settingObstruction",
             "settingOpenMs", "settingCloseMs", "settingMinCmd", "settingToggleOnly",
@@ -622,6 +646,10 @@
         ];
         ids.forEach((id) => els[id] = document.getElementById(id));
         let adminPin = "";
+        let passwordConfigured = false;
+        let accessGranted = false;
+        let dashboardStarted = false;
+        let socket = null;
 
         function setText(id, value) {
             els[id].textContent = value === null || value === undefined || value === "" ? "Unknown" : String(value);
@@ -629,6 +657,23 @@
 
         function adminHeaders() {
             return adminPin ? { "X-Admin-PIN": adminPin } : {};
+        }
+
+        function updateAccessUi() {
+            const locked = passwordConfigured && !accessGranted;
+            els.dashboard.classList.toggle("hidden", locked);
+            els.accessPanel.classList.toggle("hidden", passwordConfigured && accessGranted);
+            els.accessUnlock.classList.toggle("hidden", !passwordConfigured);
+            els.accessSetup.classList.toggle("hidden", passwordConfigured);
+            els.adminUnlock.disabled = !passwordConfigured;
+            els.adminSetup.textContent = passwordConfigured ? "Update Password" : "Set Password";
+            if (locked) {
+                els.accessStatus.textContent = "Password required.";
+            } else if (!passwordConfigured) {
+                els.accessStatus.textContent = "No password configured.";
+            } else {
+                els.accessStatus.textContent = "Access unlocked.";
+            }
         }
 
         async function apiJson(url, options = {}, useAdmin = false) {
@@ -651,6 +696,61 @@
                 throw new Error(data.error || `HTTP ${response.status}`);
             }
             return data;
+        }
+
+        async function refreshAccess() {
+            const data = await apiJson("/api/access", {}, true);
+            passwordConfigured = Boolean(data.password_configured || data.admin_pin_configured);
+            accessGranted = !passwordConfigured || Boolean(data.authenticated);
+            updateAccessUi();
+            return data;
+        }
+
+        async function unlockWithPassword(pin) {
+            if (!pin) {
+                throw new Error("missing_password");
+            }
+            await apiJson("/api/admin/check", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "X-Admin-PIN": pin },
+                body: JSON.stringify({})
+            });
+            adminPin = pin;
+            passwordConfigured = true;
+            accessGranted = true;
+            updateAccessUi();
+            reconnectSocket();
+            startDashboard();
+        }
+
+        async function setWebPassword(currentPin, newPin) {
+            const nextPin = newPin || currentPin;
+            if (!nextPin) {
+                throw new Error("missing_password");
+            }
+            const headers = { "Content-Type": "application/json" };
+            const payload = passwordConfigured ? { new_pin: nextPin } : { pin: nextPin };
+            if (passwordConfigured) {
+                const authPin = currentPin || adminPin;
+                if (!authPin) {
+                    throw new Error("current_password_required");
+                }
+                headers["X-Admin-PIN"] = authPin;
+            }
+            await apiJson("/api/admin/setup", {
+                method: "POST",
+                headers,
+                body: JSON.stringify(payload)
+            });
+            adminPin = nextPin;
+            passwordConfigured = true;
+            accessGranted = true;
+            els.accessPassword.value = "";
+            els.adminPin.value = "";
+            els.adminNewPin.value = "";
+            updateAccessUi();
+            reconnectSocket();
+            startDashboard();
         }
 
         function formatDuration(ms) {
@@ -700,9 +800,7 @@
 
         async function refreshStatus() {
             try {
-                const response = await fetch("/api/status", { cache: "no-store" });
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                renderStatus(await response.json());
+                renderStatus(await apiJson("/api/status", {}, true));
             } catch (err) {
                 setText("healthState", "Status unavailable");
                 setText("healthDetail", err.message);
@@ -764,7 +862,10 @@
                 setText("positionTargetLabel", `${els.positionTarget.value}%`);
             }
 
-            setText("adminStatus", settings.admin_pin_configured ? (adminPin ? "Admin controls unlocked." : "PIN configured. Unlock to change controls.") : "Create an admin PIN to enable controls.");
+            passwordConfigured = Boolean(settings.admin_pin_configured);
+            accessGranted = !passwordConfigured || Boolean(adminPin);
+            updateAccessUi();
+            setText("adminStatus", passwordConfigured ? (adminPin ? "Web UI password active." : "Unlock to change protected controls.") : "Set a Web UI password.");
             setText("homekitPairings", homekit.paired_controller_count === null || homekit.paired_controller_count === undefined ? "Unknown" : `${homekit.paired_controller_count} controller(s)`);
             setText("eventsStatus", `${events.total || 0} recent events, ${events.critical || 0} critical, ${events.dropped || 0} dropped.`);
         }
@@ -783,7 +884,7 @@
 
         async function refreshSettings() {
             try {
-                renderSettings(await apiJson("/api/settings"));
+                renderSettings(await apiJson("/api/settings", {}, true));
             } catch (err) {
                 els.settingsStatus.textContent = `Settings unavailable: ${err.message}`;
             }
@@ -791,11 +892,12 @@
 
         async function refreshHomeKitSetup() {
             try {
-                const data = await apiJson("/api/homekit/setup");
+                const data = await apiJson("/api/homekit/setup", {}, true);
                 setText("homekitPairings", data.paired_controller_count === null || data.paired_controller_count === undefined ? "Unknown" : `${data.paired_controller_count} controller(s)`);
                 if (data.setup_available && data.setup_payload) {
                     setText("homekitPayload", data.setup_payload);
-                    els.homekitQr.src = `/api/homekit/setup-qr.svg?t=${Date.now()}`;
+                    const pinParam = passwordConfigured && adminPin ? `&pin=${encodeURIComponent(adminPin)}` : "";
+                    els.homekitQr.src = `/api/homekit/setup-qr.svg?t=${Date.now()}${pinParam}`;
                     els.homekitQr.classList.remove("hidden");
                     els.homekitStatus.textContent = "Scan this before pairing. It is hidden after pairing.";
                 } else {
@@ -850,7 +952,7 @@
                 if (els.eventCategory.value) params.set("category", els.eventCategory.value);
                 if (els.eventSeverity.value) params.set("severity", els.eventSeverity.value);
                 params.set("limit", "80");
-                renderEvents(await apiJson(`/api/events?${params}`));
+                renderEvents(await apiJson(`/api/events?${params}`, {}, true));
             } catch (err) {
                 els.eventsStatus.textContent = `Events unavailable: ${err.message}`;
             }
@@ -910,8 +1012,7 @@
 
         document.getElementById("refreshGdo").addEventListener("click", async () => {
             try {
-                const response = await fetch("/api/gdo/refresh", { method: "POST" });
-                const data = await response.json();
+                const data = await apiJson("/api/gdo/refresh", { method: "POST" }, true);
                 els.wifiSaveStatus.textContent = data.ok ? "GDO status request queued." : `GDO status request failed: ${data.result}`;
                 setTimeout(refreshStatus, 600);
             } catch (err) {
@@ -923,37 +1024,48 @@
             setText("positionTargetLabel", `${els.positionTarget.value}%`);
         });
 
-        els.adminUnlock.addEventListener("click", async () => {
-            const pin = els.adminPin.value;
+        els.accessUnlock.addEventListener("click", async () => {
             try {
-                await apiJson("/api/admin/check", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json", "X-Admin-PIN": pin },
-                    body: JSON.stringify({})
-                });
-                adminPin = pin;
-                els.adminStatus.textContent = "Admin controls unlocked.";
+                await unlockWithPassword(els.accessPassword.value);
+                els.accessStatus.textContent = "Access unlocked.";
+            } catch (err) {
+                adminPin = "";
+                accessGranted = false;
+                updateAccessUi();
+                els.accessStatus.textContent = `Unlock failed: ${err.message}`;
+            }
+        });
+
+        els.accessSetup.addEventListener("click", async () => {
+            try {
+                await setWebPassword("", els.accessPassword.value);
+                els.accessStatus.textContent = "Password set.";
+            } catch (err) {
+                els.accessStatus.textContent = `Password setup failed: ${err.message}`;
+            }
+        });
+
+        els.adminUnlock.addEventListener("click", async () => {
+            try {
+                await unlockWithPassword(els.adminPin.value);
+                els.adminStatus.textContent = "Protected controls unlocked.";
                 refreshStatus();
             } catch (err) {
                 adminPin = "";
+                accessGranted = false;
+                updateAccessUi();
                 els.adminStatus.textContent = `Unlock failed: ${err.message}`;
                 refreshStatus();
             }
         });
 
         els.adminSetup.addEventListener("click", async () => {
-            const pin = els.adminPin.value;
             try {
-                await apiJson("/api/admin/setup", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ pin })
-                });
-                adminPin = pin;
-                els.adminStatus.textContent = "Admin PIN created.";
+                await setWebPassword(els.adminPin.value || adminPin, els.adminNewPin.value || els.adminPin.value);
+                els.adminStatus.textContent = "Web UI password saved.";
                 refreshStatus();
             } catch (err) {
-                els.adminStatus.textContent = `PIN setup failed: ${err.message}`;
+                els.adminStatus.textContent = `Password save failed: ${err.message}`;
             }
         });
 
@@ -1016,31 +1128,88 @@
             }
         });
 
-        let protocol = document.location.protocol === "https:" ? "wss:" : "ws:";
-        let wsHostStr = `${protocol}//${document.location.host}${document.location.pathname}`;
-        wsHostStr += document.location.pathname === "/" ? "ws" : "/ws";
-        var socket = new WebSocket(wsHostStr);
+        function buildWsUrl() {
+            let protocol = document.location.protocol === "https:" ? "wss:" : "ws:";
+            let wsHostStr = `${protocol}//${document.location.host}${document.location.pathname}`;
+            wsHostStr += document.location.pathname === "/" ? "ws" : "/ws";
+            if (passwordConfigured && adminPin) {
+                wsHostStr += `?pin=${encodeURIComponent(adminPin)}`;
+            }
+            return wsHostStr;
+        }
 
-        socket.onopen = function () {
-            setSocketState("ok", "Config socket");
-        };
-        socket.onclose = function () {
-            setSocketState("warn", "Socket closed");
-            setTimeout(() => document.location.reload(), 2500);
-        };
-        socket.onerror = function () {
-            setSocketState("bad", "Socket error");
-        };
-        socket.onmessage = function (event) {
-            receiveWsData(event.data);
-        };
+        function connectSocket() {
+            if (socket || (passwordConfigured && !adminPin)) {
+                return;
+            }
+            socket = new WebSocket(buildWsUrl());
+            socket.onopen = function () {
+                setSocketState("ok", "Config socket");
+            };
+            socket.onclose = function () {
+                socket = null;
+                setSocketState("warn", "Socket closed");
+                if (!passwordConfigured || adminPin) {
+                    setTimeout(connectSocket, 2500);
+                }
+            };
+            socket.onerror = function () {
+                setSocketState("bad", "Socket error");
+            };
+            socket.onmessage = function (event) {
+                receiveWsData(event.data);
+            };
+        }
 
-        refreshStatus();
-        refreshSettings();
-        refreshHomeKitSetup();
-        refreshEvents();
-        setInterval(refreshStatus, 5000);
-        setInterval(refreshEvents, 15000);
+        function reconnectSocket() {
+            if (socket) {
+                socket.onclose = null;
+                socket.close();
+                socket = null;
+            }
+            connectSocket();
+        }
+
+        function startDashboard() {
+            connectSocket();
+            if (dashboardStarted) {
+                refreshStatus();
+                refreshSettings();
+                refreshHomeKitSetup();
+                refreshEvents();
+                return;
+            }
+            dashboardStarted = true;
+            refreshStatus();
+            refreshSettings();
+            refreshHomeKitSetup();
+            refreshEvents();
+        }
+
+        async function boot() {
+            try {
+                await refreshAccess();
+                if (!passwordConfigured || accessGranted) {
+                    startDashboard();
+                }
+            } catch (err) {
+                els.accessPanel.classList.remove("hidden");
+                els.dashboard.classList.add("hidden");
+                els.accessStatus.textContent = `Access check failed: ${err.message}`;
+            }
+        }
+
+        boot();
+        setInterval(() => {
+            if (!passwordConfigured || accessGranted) {
+                refreshStatus();
+            }
+        }, 5000);
+        setInterval(() => {
+            if (!passwordConfigured || accessGranted) {
+                refreshEvents();
+            }
+        }, 15000);
     </script>
 </body>
 </html>
