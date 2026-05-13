@@ -79,8 +79,22 @@ static void wifi_event_handler_ap(void *arg, esp_event_base_t event_base,
     }
 }
 
-static void init_softap(char *ap_ssid, char *ap_pass)
+static esp_err_t init_softap(char *ap_ssid, char *ap_pass)
 {
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid_len = 0,
+            .max_connection = AP_MAX_STA_CONN,
+            .authmode = WIFI_AUTH_WPA_WPA2_PSK},
+    };
+    size_t ssid_len = ap_ssid ? strlen(ap_ssid) : 0;
+    size_t pass_len = ap_pass ? strlen(ap_pass) : 0;
+    if (ssid_len == 0 || ssid_len > sizeof(wifi_config.ap.ssid) || pass_len > 63 || (pass_len > 0 && pass_len < 8))
+    {
+        ESP_LOGE(TAG, "invalid AP Wi-Fi config");
+        return ESP_ERR_INVALID_ARG;
+    }
+
     // ESP_ERROR_CHECK(esp_netif_init());
     // ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_ap();
@@ -93,17 +107,15 @@ static void init_softap(char *ap_ssid, char *ap_pass)
                                                         &wifi_event_handler_ap,
                                                         NULL,
                                                         NULL));
+    memcpy(wifi_config.ap.ssid, ap_ssid, ssid_len);
+    wifi_config.ap.ssid_len = ssid_len;
+    if (pass_len)
+    {
+        memcpy(wifi_config.ap.password, ap_pass, pass_len);
+        wifi_config.ap.password[pass_len] = 0;
+    }
 
-    wifi_config_t wifi_config = {
-        .ap = {
-            .ssid_len = 0,
-            .max_connection = AP_MAX_STA_CONN,
-            .authmode = WIFI_AUTH_WPA_WPA2_PSK},
-    };
-    snprintf((char *)wifi_config.ap.ssid, sizeof(wifi_config.ap.ssid), "%s", ap_ssid ? ap_ssid : "");
-    snprintf((char *)wifi_config.ap.password, sizeof(wifi_config.ap.password), "%s", ap_pass ? ap_pass : "");
-
-    if (strlen((char *)wifi_config.ap.password) < 8)
+    if (pass_len == 0)
     {
         wifi_config.ap.authmode = WIFI_AUTH_OPEN;
         wifi_config.ap.password[0] = 0;
@@ -114,12 +126,21 @@ static void init_softap(char *ap_ssid, char *ap_pass)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s",
-             (char *)wifi_config.ap.ssid);
+             ap_ssid);
+    return ESP_OK;
 }
 
 static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
 {
     esp_err_t err = ESP_OK;
+    size_t ssid_len = sta_ssid ? strlen(sta_ssid) : 0;
+    size_t pass_len = sta_pass ? strlen(sta_pass) : 0;
+    if (ssid_len == 0 || ssid_len > sizeof(((wifi_config_t *)0)->sta.ssid) || pass_len > 63)
+    {
+        ESP_LOGE(TAG, "invalid STA Wi-Fi config");
+        return ESP_ERR_INVALID_ARG;
+    }
+
     s_wifi_event_group = xEventGroupCreate();
     if (!s_wifi_event_group)
     {
@@ -155,8 +176,12 @@ static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
                 .required = false},
         },
     };
-    snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%s", sta_ssid ? sta_ssid : "");
-    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s", sta_pass ? sta_pass : "");
+    memcpy(wifi_config.sta.ssid, sta_ssid, ssid_len);
+    if (pass_len)
+    {
+        memcpy(wifi_config.sta.password, sta_pass, pass_len);
+        wifi_config.sta.password[pass_len] = 0;
+    }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -239,7 +264,7 @@ _ret:
 esp_err_t nvs_wifi_connect(void)
 {
     char nvs_mode[32] = {0};
-    char nvs_ssid[32] = {0};
+    char nvs_ssid[33] = {0};
     char nvs_password[64] = {0};
 
     esp_err_t err = nvs_flash_init();
@@ -259,9 +284,14 @@ esp_err_t nvs_wifi_connect(void)
         if (strncmp(NVS_WIFI_CONNECT_MODE_STA, nvs_mode, sizeof(NVS_WIFI_CONNECT_MODE_STA)) == 0) // sta
         {
             esp_err_t ssid_err = nvs_get_key_value_str(NVS_STA_ESP_WIFI_SSID_KEY, nvs_ssid, sizeof(nvs_ssid));
-            if (nvs_get_key_value_str(NVS_STA_ESP_WIFI_PASS_KEY, nvs_password, sizeof(nvs_password)) != ESP_OK)
+            esp_err_t pass_err = nvs_get_key_value_str(NVS_STA_ESP_WIFI_PASS_KEY, nvs_password, sizeof(nvs_password));
+            if (pass_err == ESP_ERR_NVS_NOT_FOUND)
             {
                 nvs_password[0] = 0;
+            }
+            else if (pass_err != ESP_OK)
+            {
+                ssid_err = pass_err;
             }
             if (ssid_err == ESP_OK)
             {
@@ -275,12 +305,21 @@ esp_err_t nvs_wifi_connect(void)
         }
         if (nvs_get_key_value_str(NVS_AP_ESP_WIFI_SSID_KEY, nvs_ssid, sizeof(nvs_ssid)) == ESP_OK)
         {
-            if (nvs_get_key_value_str(NVS_AP_ESP_WIFI_PASS_KEY, nvs_password, sizeof(nvs_password)) != ESP_OK)
+            esp_err_t pass_err = nvs_get_key_value_str(NVS_AP_ESP_WIFI_PASS_KEY, nvs_password, sizeof(nvs_password));
+            if (pass_err == ESP_ERR_NVS_NOT_FOUND)
             {
                 nvs_password[0] = 0;
             }
-            init_softap(nvs_ssid, nvs_password); // ssid & pass OK
-            return err;
+            else if (pass_err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "AP password invalid");
+                return pass_err;
+            }
+            if (init_softap(nvs_ssid, nvs_password) == ESP_OK) // ssid & pass OK
+            {
+                return err;
+            }
+            return ESP_ERR_INVALID_ARG;
         }
     }
     ESP_LOGE(TAG, "AP ERR ssid=%s. Start default AP", nvs_ssid);

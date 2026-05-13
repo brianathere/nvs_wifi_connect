@@ -64,6 +64,7 @@ typedef esp_err_t (*nvs_wifi_connect_auth_handler_t)(httpd_req_t *req);
 *          error response and return a non-OK esp_err_t to deny access.
 */
 void nvs_wifi_connect_set_auth_handler(nvs_wifi_connect_auth_handler_t auth_handler);
+void nvs_wifi_connect_set_write_auth_handler(nvs_wifi_connect_auth_handler_t auth_handler);
 
 /*
 *   @brief  start nvs_wifi_connect httpd server, uri web page read existing nvs wifi data  & write new nvs wifi data ( ap/sta mode, wifi ssid/pass )

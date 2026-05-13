@@ -9,10 +9,12 @@
 #include "nvs_wifi_connect.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "jsmn.h"
 
 static const char *TAG = "nvs_wifi_connect_http_server";
+#define NVS_WIFI_CONNECT_WS_MAX_PAYLOAD 512
 
 ESP_EVENT_DECLARE_BASE(NVS_WIFI_CONNECT_STOP_HTTPD);
 ESP_EVENT_DEFINE_BASE(NVS_WIFI_CONNECT_STOP_HTTPD);
@@ -24,6 +26,7 @@ enum
 static int srv_restart = 0;
 static nvs_wifi_connect_register_uri_handler_t srv_register_uri_handler;
 static nvs_wifi_connect_auth_handler_t srv_auth_handler;
+static nvs_wifi_connect_auth_handler_t srv_write_auth_handler;
 static bool srv_event_handlers_registered;
 
 static esp_err_t stop_webserver(httpd_handle_t server);
@@ -37,12 +40,25 @@ void nvs_wifi_connect_set_auth_handler(nvs_wifi_connect_auth_handler_t auth_hand
     srv_auth_handler = auth_handler;
 }
 
+void nvs_wifi_connect_set_write_auth_handler(nvs_wifi_connect_auth_handler_t auth_handler)
+{
+    srv_write_auth_handler = auth_handler;
+}
+
 static esp_err_t check_auth(httpd_req_t *req)
 {
     if (!srv_auth_handler) {
         return ESP_OK;
     }
     return srv_auth_handler(req);
+}
+
+static esp_err_t check_write_auth(httpd_req_t *req)
+{
+    if (srv_write_auth_handler) {
+        return srv_write_auth_handler(req);
+    }
+    return check_auth(req);
 }
 
 static void unregister_server_event_handlers(void)
@@ -96,20 +112,51 @@ static void send_json_kv(const char *key, const char *value, httpd_req_t *req)
     send_json_string(buf, req);
 }
 
-static esp_err_t copy_json_token(char *dst, size_t dst_size, const char *jsonstr, const jsmntok_t *token)
+static esp_err_t copy_json_string_token(char *dst, size_t dst_size, const char *jsonstr, const jsmntok_t *token)
 {
-    if (!dst || dst_size == 0 || !jsonstr || !token || token->start < 0 || token->end < token->start) {
+    if (!dst || dst_size == 0 || !jsonstr || !token || token->start < 0 || token->end < token->start || token->type != JSMN_STRING) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    size_t token_len = (size_t)(token->end - token->start);
-    if (token_len >= dst_size) {
-        dst[0] = 0;
-        return ESP_ERR_INVALID_SIZE;
+    size_t out = 0;
+    for (int i = token->start; i < token->end; ++i) {
+        unsigned char ch = (unsigned char)jsonstr[i];
+        if (ch == '\\') {
+            if (++i >= token->end) {
+                return ESP_ERR_INVALID_ARG;
+            }
+            switch (jsonstr[i]) {
+            case '"':
+            case '\\':
+            case '/':
+                ch = (unsigned char)jsonstr[i];
+                break;
+            case 'b':
+                ch = '\b';
+                break;
+            case 'f':
+                ch = '\f';
+                break;
+            case 'n':
+                ch = '\n';
+                break;
+            case 'r':
+                ch = '\r';
+                break;
+            case 't':
+                ch = '\t';
+                break;
+            default:
+                return ESP_ERR_INVALID_ARG;
+            }
+        }
+        if (out + 1 >= dst_size) {
+            dst[0] = 0;
+            return ESP_ERR_INVALID_SIZE;
+        }
+        dst[out++] = (char)ch;
     }
-
-    memcpy(dst, jsonstr + token->start, token_len);
-    dst[token_len] = 0;
+    dst[out] = 0;
     return ESP_OK;
 }
 
@@ -132,14 +179,14 @@ static esp_err_t json_to_str_parm(char *jsonstr, char *nameStr, size_t name_size
         nameStr[0] = 0;
         return ESP_FAIL;
     }
-    esp_err_t err = copy_json_token(nameStr, name_size, jsonstr, &t[2]);
+    esp_err_t err = copy_json_string_token(nameStr, name_size, jsonstr, &t[2]);
     if (err != ESP_OK) {
         valStr[0] = 0;
         return err;
     }
     if (r > 4)
     {
-        err = copy_json_token(valStr, val_size, jsonstr, &t[4]);
+        err = copy_json_string_token(valStr, val_size, jsonstr, &t[4]);
         if (err != ESP_OK) {
             return err;
         }
@@ -173,15 +220,47 @@ static void send_nvs_data(httpd_req_t *req)
     send_json_kv(NVS_AP_ESP_WIFI_SSID_KEY, nvs_data, req);}
     required_size = sizeof(nvs_data);
     if(nvs_get_str(nvs_handle, NVS_AP_ESP_WIFI_PASS_KEY, nvs_data, &required_size)==ESP_OK){
-    send_json_kv(NVS_AP_ESP_WIFI_PASS_KEY, nvs_data, req);}
+    send_json_kv("nvsApPassConfigured", nvs_data[0] ? "true" : "false", req);}
     required_size = sizeof(nvs_data);
     if(nvs_get_str(nvs_handle, NVS_STA_ESP_WIFI_SSID_KEY, nvs_data, &required_size)==ESP_OK){
     send_json_kv(NVS_STA_ESP_WIFI_SSID_KEY, nvs_data, req);}
     required_size = sizeof(nvs_data);
     if(nvs_get_str(nvs_handle, NVS_STA_ESP_WIFI_PASS_KEY, nvs_data, &required_size)==ESP_OK){
-    send_json_kv(NVS_STA_ESP_WIFI_PASS_KEY, nvs_data, req);}
+    send_json_kv("nvsStaPassConfigured", nvs_data[0] ? "true" : "false", req);}
     nvs_close(nvs_handle);
 }
+
+static bool is_allowed_wifi_key(const char *key)
+{
+    return strcmp(key, NVS_STA_AP_DEFAULT_MODE_KEY) == 0 ||
+           strcmp(key, NVS_AP_ESP_WIFI_SSID_KEY) == 0 ||
+           strcmp(key, NVS_AP_ESP_WIFI_PASS_KEY) == 0 ||
+           strcmp(key, NVS_STA_ESP_WIFI_SSID_KEY) == 0 ||
+           strcmp(key, NVS_STA_ESP_WIFI_PASS_KEY) == 0;
+}
+
+static esp_err_t validate_wifi_value(const char *key, const char *value)
+{
+    size_t len;
+    if (!key || !value || !is_allowed_wifi_key(key)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    len = strlen(value);
+    if (strcmp(key, NVS_STA_AP_DEFAULT_MODE_KEY) == 0) {
+        return (strcmp(value, NVS_WIFI_CONNECT_MODE_STA) == 0 || strcmp(value, NVS_WIFI_CONNECT_MODE_AP) == 0) ? ESP_OK : ESP_ERR_INVALID_ARG;
+    }
+    if (strcmp(key, NVS_AP_ESP_WIFI_SSID_KEY) == 0 || strcmp(key, NVS_STA_ESP_WIFI_SSID_KEY) == 0) {
+        return (len > 0 && len <= 32) ? ESP_OK : ESP_ERR_INVALID_ARG;
+    }
+    if (strcmp(key, NVS_AP_ESP_WIFI_PASS_KEY) == 0) {
+        return (len == 0 || (len >= 8 && len <= 63)) ? ESP_OK : ESP_ERR_INVALID_ARG;
+    }
+    if (strcmp(key, NVS_STA_ESP_WIFI_PASS_KEY) == 0) {
+        return (len <= 63) ? ESP_OK : ESP_ERR_INVALID_ARG;
+    }
+    return ESP_ERR_INVALID_ARG;
+}
+
 // write wifi data from ws to nvs
 static void set_nvs_data(char *jsonstr, httpd_req_t *req)
 {
@@ -202,8 +281,13 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
     }
     else
     {
-        if (strncmp(key, NVS_COMPARE_KEY_PARAM, sizeof(NVS_COMPARE_KEY_PARAM)-1) == 0  ) // key/value -> wifi data
+        if (is_allowed_wifi_key(key)) // key/value -> wifi data
         {
+            err = validate_wifi_value(key, value);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "ERR invalid value for key %s", key);
+                goto close;
+            }
             err = nvs_set_str(nvs_handle, key, value); // write key/value to nvs
             if (err != ESP_OK)
             {
@@ -218,13 +302,13 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
                 }
             }
         }
-        else if (strncmp(key, NVS_WIFI_RESTART_KEY, sizeof(NVS_WIFI_RESTART_KEY)) == 0)// key/value ->  restart or write
+        else if (strcmp(key, NVS_WIFI_RESTART_KEY) == 0)// key/value ->  restart or write
         {
             // if value == NVS_WIFI_RESTART_VALUE_RESTART -> full restart esp32 regardless of value srv_restart
             // if srv_restart == NVS_WIFI_CONNECT_MODE_STAY_ACTIVE -> no operation
             // if srv_restart == NVS_WIFI_CONNECT_MODE_STOP_SERVER -> stop httpd
             // if srv_restart == NVS_WIFI_CONNECT_MODE_RESTART_ESP32 -> full restart esp32 regardless of value NVS_WIFI_RESTART_VALUE_RESTART
-            if (srv_restart == NVS_WIFI_CONNECT_MODE_RESTART_ESP32 || strncmp(value, NVS_WIFI_RESTART_VALUE_RESTART, sizeof(NVS_WIFI_RESTART_VALUE_RESTART)) == 0)
+            if (srv_restart == NVS_WIFI_CONNECT_MODE_RESTART_ESP32 || strcmp(value, NVS_WIFI_RESTART_VALUE_RESTART) == 0)
             {
                 esp_restart();
             }
@@ -238,7 +322,12 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
                 }
             }
         }
+        else
+        {
+            ESP_LOGE(TAG, "ERR invalid key %s", key);
+        }
     }
+close:
     nvs_close(nvs_handle);
 }
 static esp_err_t ws_handler(httpd_req_t *req)
@@ -264,6 +353,14 @@ static esp_err_t ws_handler(httpd_req_t *req)
         ESP_LOGE(TAG, "httpd_ws_recv_frame failed to get frame len with %d", ret);
         return ret;
     }
+    if (ws_pkt.type != HTTPD_WS_TYPE_TEXT) {
+        ESP_LOGE(TAG, "Unsupported WebSocket frame type %d", ws_pkt.type);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (ws_pkt.len > NVS_WIFI_CONNECT_WS_MAX_PAYLOAD || ws_pkt.len == SIZE_MAX) {
+        ESP_LOGE(TAG, "WebSocket frame too large: %zu", ws_pkt.len);
+        return ESP_ERR_INVALID_SIZE;
+    }
     if (ws_pkt.len)
     {
         /* ws_pkt.len + 1 is for NULL termination as we are expecting a string */
@@ -284,6 +381,11 @@ static esp_err_t ws_handler(httpd_req_t *req)
         }
     }
     if (ws_pkt.payload) {
+        ret = check_write_auth(req);
+        if (ret != ESP_OK) {
+            free(buf);
+            return ret;
+        }
         set_nvs_data((char *)ws_pkt.payload, req);
     }
     free(buf);
@@ -291,8 +393,8 @@ static esp_err_t ws_handler(httpd_req_t *req)
 }
 static esp_err_t get_handler(httpd_req_t *req)
 {
-    extern const unsigned char nvs_wifi_connect_html_start[] asm("_binary_nvs_wifi_connect_html_start");
-    extern const unsigned char nvs_wifi_connect_html_end[] asm("_binary_nvs_wifi_connect_html_end");
+    extern const unsigned char nvs_wifi_connect_html_start[] __asm__("_binary_nvs_wifi_connect_html_start");
+    extern const unsigned char nvs_wifi_connect_html_end[] __asm__("_binary_nvs_wifi_connect_html_end");
     const size_t nvs_wifi_connect_html_size = (nvs_wifi_connect_html_end - nvs_wifi_connect_html_start);
 
     httpd_resp_send_chunk(req, (const char *)nvs_wifi_connect_html_start, nvs_wifi_connect_html_size);
